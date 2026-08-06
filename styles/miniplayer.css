@@ -244,3 +244,27 @@ body.ytm-floating-active ytm-statement-banner-renderer {
   pointer-events: none !important;
 }
 
+/* Miniplayer Corner Resize Handle */
+.ytm-miniplayer-resize-handle {
+  position: absolute;
+  bottom: 0;
+  right: 0;
+  width: 20px;
+  height: 20px;
+  cursor: se-resize;
+  z-index: 100;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  touch-action: none;
+}
+
+.ytm-miniplayer-resize-handle::after {
+  content: "";
+  width: 8px;
+  height: 8px;
+  border-right: 2px solid rgba(255, 255, 255, 0.7);
+  border-bottom: 2px solid rgba(255, 255, 255, 0.7);
+  border-radius: 1px;
+}
+

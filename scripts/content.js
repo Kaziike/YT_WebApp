@@ -1,6 +1,7 @@
 /**
  * YouTube Mobile App Simulator - Content Script
  * Hybrid Architecture: Pre-unmount reparenting, Universal Video State Engine, and Hybrid Embed Fallback.
+ * Features: Mini-player resizing (presets + touch/mouse corner drag), Shorts auto-close, Watch page enforcement.
  */
 (function () {
   'use strict';
@@ -10,6 +11,7 @@
   // Configuration
   let config = {
     miniPlayerEnabled: true,
+    miniPlayerWidth: 320,
     backgroundAudio: true,
     autoMinimizeOnNav: true
   };
@@ -23,6 +25,7 @@
   let lastWatchUrl = null;
   let isFloating = false;
   let isDragging = false;
+  let isResizing = false;
   let dragOffset = { x: 0, y: 0 };
   let touchStartY = 0;
   let currentVideoTitle = 'YouTube Video';
@@ -56,10 +59,12 @@
   // 2. Load and Sync Settings
   function loadSettings() {
     if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
-      chrome.storage.local.get(['miniPlayerEnabled', 'backgroundAudio', 'autoMinimizeOnNav'], (res) => {
+      chrome.storage.local.get(['miniPlayerEnabled', 'miniPlayerWidth', 'backgroundAudio', 'autoMinimizeOnNav'], (res) => {
         if (res.miniPlayerEnabled !== undefined) config.miniPlayerEnabled = res.miniPlayerEnabled;
+        if (res.miniPlayerWidth !== undefined) config.miniPlayerWidth = res.miniPlayerWidth;
         if (res.backgroundAudio !== undefined) config.backgroundAudio = res.backgroundAudio;
         if (res.autoMinimizeOnNav !== undefined) config.autoMinimizeOnNav = res.autoMinimizeOnNav;
+        applyMiniPlayerSize();
         sendConfigToInjected();
       });
     }
@@ -69,6 +74,7 @@
     chrome.runtime.onMessage.addListener((req, sender, sendResponse) => {
       if (req.type === 'UPDATE_SETTINGS') {
         config = { ...config, ...req.settings };
+        applyMiniPlayerSize();
         sendConfigToInjected();
         if (!config.miniPlayerEnabled && isFloating) {
           restoreVideo();
@@ -79,10 +85,25 @@
     });
   }
 
+  // Apply Mini-Player Width & Height
+  function applyMiniPlayerSize() {
+    if (!miniplayerEl) return;
+    const width = Math.max(220, Math.min(config.miniPlayerWidth || 320, 520));
+    miniplayerEl.style.setProperty('width', width + 'px', 'important');
+    
+    // Also apply to CSS sticky floating player if present
+    const pipPlayer = document.querySelector('.ytm-pip-floating');
+    if (pipPlayer) {
+      pipPlayer.style.setProperty('width', width + 'px', 'important');
+      pipPlayer.style.setProperty('height', Math.round(width * 9 / 16) + 'px', 'important');
+    }
+  }
+
   // 3. Create Floating Mini-Player UI
   function createMiniPlayerUI() {
     if (document.getElementById('ytm-floating-miniplayer')) {
       miniplayerEl = document.getElementById('ytm-floating-miniplayer');
+      applyMiniPlayerSize();
       return;
     }
 
@@ -116,9 +137,11 @@
           </button>
         </div>
       </div>
+      <div class="ytm-miniplayer-resize-handle" id="ytm-resize-handle" title="Kéo để chỉnh kích thước"></div>
     `;
 
     document.body.appendChild(miniplayerEl);
+    applyMiniPlayerSize();
 
     // Event listeners
     document.getElementById('ytm-btn-pip').addEventListener('click', toggleSystemPiP);
@@ -134,6 +157,7 @@
     });
 
     setupTouchAndDrag();
+    setupResizeGesture();
   }
 
   function toggleSystemPiP() {
@@ -147,13 +171,13 @@
     }
   }
 
-  // 4. Touch & Drag Gestures
+  // 4. Touch & Drag Gestures + Corner Resize Handler
   function setupTouchAndDrag() {
     const handle = document.getElementById('ytm-drag-handle');
     if (!handle) return;
 
     const onStart = (e) => {
-      if (e.target.closest('.ytm-miniplayer-controls')) return;
+      if (e.target.closest('.ytm-miniplayer-controls') || isResizing) return;
       isDragging = true;
       miniplayerEl.classList.add('ytm-dragging');
 
@@ -216,6 +240,59 @@
 
     handle.addEventListener('mousedown', onStart);
     handle.addEventListener('touchstart', onStart, { passive: false });
+  }
+
+  // Corner Drag Resize Gesture
+  function setupResizeGesture() {
+    const resizeHandle = document.getElementById('ytm-resize-handle');
+    if (!resizeHandle) return;
+
+    let startX = 0;
+    let startWidth = 320;
+
+    const onResizeStart = (e) => {
+      e.stopPropagation();
+      isResizing = true;
+      startX = e.touches ? e.touches[0].clientX : e.clientX;
+      startWidth = miniplayerEl.offsetWidth;
+
+      if (e.type === 'touchstart') {
+        document.addEventListener('touchmove', onResizeMove, { passive: false });
+        document.addEventListener('touchend', onResizeEnd);
+      } else {
+        document.addEventListener('mousemove', onResizeMove);
+        document.addEventListener('mouseup', onResizeEnd);
+      }
+    };
+
+    const onResizeMove = (e) => {
+      if (!isResizing) return;
+      const currentX = e.touches ? e.touches[0].clientX : e.clientX;
+      const deltaX = currentX - startX;
+      const newWidth = Math.max(220, Math.min(startWidth + deltaX, 520));
+
+      config.miniPlayerWidth = newWidth;
+      applyMiniPlayerSize();
+
+      if (e.cancelable) e.preventDefault();
+    };
+
+    const onResizeEnd = () => {
+      if (!isResizing) return;
+      isResizing = false;
+      document.removeEventListener('mousemove', onResizeMove);
+      document.removeEventListener('mouseup', onResizeEnd);
+      document.removeEventListener('touchmove', onResizeMove);
+      document.removeEventListener('touchend', onResizeEnd);
+
+      // Save resized width to storage
+      if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
+        chrome.storage.local.set({ miniPlayerWidth: config.miniPlayerWidth });
+      }
+    };
+
+    resizeHandle.addEventListener('mousedown', onResizeStart);
+    resizeHandle.addEventListener('touchstart', onResizeStart, { passive: false });
   }
 
   function resetMiniPlayerPosition() {
@@ -379,7 +456,9 @@
 
   // 6. Float Mechanics & Hybrid Fallback Trigger (CSS Sticky Floating - Zero Reparenting!)
   function floatVideo() {
-    if (!config.miniPlayerEnabled || isFloating) return;
+    const isWatch = location.pathname === '/watch';
+    const isShorts = location.pathname.startsWith('/shorts');
+    if (!config.miniPlayerEnabled || isFloating || isWatch || isShorts) return;
 
     updateWatchVideoState();
     const targetPlayer = getPlayerToFloat();
@@ -390,13 +469,13 @@
       const titleEl = document.getElementById('ytm-mini-title');
       titleEl.textContent = currentVideoTitle || (cachedWatchVideoState ? cachedWatchVideoState.title : 'YouTube Mobile Video');
 
-      // CSS Fixed Floating directly on original player container without reparenting (Prevents PlayerProxy crash!)
+      const width = Math.max(220, Math.min(config.miniPlayerWidth || 320, 520));
       targetPlayer.classList.add('ytm-pip-floating');
       targetPlayer.style.setProperty('position', 'fixed', 'important');
       targetPlayer.style.setProperty('bottom', '64px', 'important');
       targetPlayer.style.setProperty('right', '12px', 'important');
-      targetPlayer.style.setProperty('width', 'min(340px, 86vw)', 'important');
-      targetPlayer.style.setProperty('height', 'calc(min(340px, 86vw) * 9 / 16)', 'important');
+      targetPlayer.style.setProperty('width', width + 'px', 'important');
+      targetPlayer.style.setProperty('height', Math.round(width * 9 / 16) + 'px', 'important');
       targetPlayer.style.setProperty('z-index', '2147483647', 'important');
       targetPlayer.style.setProperty('border-radius', '14px', 'important');
       targetPlayer.style.setProperty('box-shadow', '0 12px 36px rgba(0,0,0,0.8)', 'important');
@@ -406,6 +485,7 @@
       targetPlayer.style.setProperty('opacity', '1', 'important');
 
       miniplayerEl.classList.remove('ytm-hidden');
+      applyMiniPlayerSize();
       isFloating = true;
 
       window.postMessage({ type: 'YTM_SIM_FLOATING_STATE', isFloating: true }, '*');
@@ -422,7 +502,6 @@
       updatePlayPauseState();
       showToast('Đang phát chế độ Mini-Player');
     } else {
-      // Fallback: If DOM player unmounted, float saved embed iframe
       if (cachedWatchVideoState && cachedWatchVideoState.videoId) {
         floatSavedVideoEmbed(cachedWatchVideoState);
       }
@@ -430,7 +509,9 @@
   }
 
   function floatSavedVideoEmbed(lastVideo) {
-    if (isFloating || !lastVideo || !lastVideo.videoId) return;
+    const isWatch = location.pathname === '/watch';
+    const isShorts = location.pathname.startsWith('/shorts');
+    if (isFloating || !lastVideo || !lastVideo.videoId || isWatch || isShorts) return;
 
     createMiniPlayerUI();
     document.body.classList.add('ytm-floating-active');
@@ -452,13 +533,16 @@
 
     miniBody.appendChild(iframe);
     miniplayerEl.classList.remove('ytm-hidden');
+    applyMiniPlayerSize();
     isFloating = true;
 
     showToast('Khôi phục Mini-Player');
   }
 
   function triggerMiniPlayerOnLeave() {
-    if (!config.miniPlayerEnabled || isFloating) return;
+    const isWatch = location.pathname === '/watch';
+    const isShorts = location.pathname.startsWith('/shorts');
+    if (!config.miniPlayerEnabled || isFloating || isWatch || isShorts) return;
 
     updateWatchVideoState();
 
@@ -466,7 +550,7 @@
       floatSavedVideoEmbed(cachedWatchVideoState);
     } else if (typeof chrome !== 'undefined' && chrome.storage && chrome.storage.local) {
       chrome.storage.local.get(['ytm_last_video'], (res) => {
-        if (res.ytm_last_video && res.ytm_last_video.videoId) {
+        if (res.ytm_last_video && res.ytm_last_video.videoId && location.pathname !== '/watch' && !location.pathname.startsWith('/shorts')) {
           floatSavedVideoEmbed(res.ytm_last_video);
         }
       });
@@ -475,8 +559,7 @@
 
   function restoreVideo() {
     document.body.classList.remove('ytm-floating-active');
-    if (!isFloating) return;
-
+    
     const targetPlayer = document.querySelector('.ytm-pip-floating, .html5-video-player, #player-container-id') || activeVideoEl;
 
     if (targetPlayer) {
@@ -554,20 +637,20 @@
   // 7. Navigation Intercept Logic
   function handleNavigationChange(targetUrl) {
     const isWatch = location.pathname === '/watch';
-    console.log('[YTM-Simulator] Navigation event. isWatch:', isWatch, 'target:', targetUrl);
+    const isShorts = location.pathname.startsWith('/shorts');
+    console.log('[YTM-Simulator] Navigation event. isWatch:', isWatch, 'isShorts:', isShorts, 'target:', targetUrl);
 
-    if (isWatch) {
-      lastWatchUrl = location.href;
-      mainWatchVideoEl = null;
-      activeVideoEl = null;
+    if (isWatch || isShorts) {
+      restoreVideo();
+      if (isWatch) {
+        lastWatchUrl = location.href;
+        mainWatchVideoEl = null;
+        activeVideoEl = null;
 
-      if (isFloating) {
-        restoreVideo();
+        setTimeout(() => {
+          updateWatchVideoState();
+        }, 300);
       }
-
-      setTimeout(() => {
-        updateWatchVideoState();
-      }, 300);
     } else {
       triggerMiniPlayerOnLeave();
     }
@@ -597,7 +680,11 @@
   });
 
   window.addEventListener('popstate', () => {
-    if (location.pathname !== '/watch') {
+    const isWatch = location.pathname === '/watch';
+    const isShorts = location.pathname.startsWith('/shorts');
+    if (isWatch || isShorts) {
+      restoreVideo();
+    } else {
       triggerMiniPlayerOnLeave();
     }
   });
@@ -632,12 +719,20 @@
   if (document.readyState === 'loading') {
     document.addEventListener('DOMContentLoaded', () => {
       createMiniPlayerUI();
-      updateWatchVideoState();
-      setTimeout(triggerMiniPlayerOnLeave, 500);
+      if (location.pathname === '/watch' || location.pathname.startsWith('/shorts')) {
+        restoreVideo();
+        updateWatchVideoState();
+      } else {
+        setTimeout(triggerMiniPlayerOnLeave, 500);
+      }
     });
   } else {
     createMiniPlayerUI();
-    updateWatchVideoState();
-    setTimeout(triggerMiniPlayerOnLeave, 500);
+    if (location.pathname === '/watch' || location.pathname.startsWith('/shorts')) {
+      restoreVideo();
+      updateWatchVideoState();
+    } else {
+      setTimeout(triggerMiniPlayerOnLeave, 500);
+    }
   }
 })();
